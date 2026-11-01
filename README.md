@@ -9,6 +9,42 @@
 Проверка идёт параллельно на нескольких ядрах: узкое место — компиляция
 (`g++`) и запуск чужих бинарников, то есть отдельные процессы.
 
+## Установка uv
+
+Проект использует [uv](https://docs.astral.sh/uv/) для зависимостей
+(официальная инструкция: <https://docs.astral.sh/uv/getting-started/installation/>).
+
+Linux / macOS:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Через пакетный менеджер (если не хочется ставить установщиком):
+
+```bash
+pipx install uv        # или: pip install uv
+```
+
+Проверка, что всё встало:
+
+```bash
+uv --version
+```
+
+Если `uv` не найден после установки — откройте новый терминал (установщик
+дописывает `~/.local/bin` в `PATH`) или добавьте его вручную:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
 ## Быстрый старт
 
 ```bash
@@ -16,7 +52,7 @@ uv sync                            # поставить зависимости (
 uv run python checker.py config.yml
 ```
 
-Либо, если зависимости уже стоят в системе:
+Либо, если зависимости уже стоят в системе (и `uv` не нужен):
 
 ```bash
 python3 checker.py config.yml
