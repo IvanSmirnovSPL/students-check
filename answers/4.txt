@@ -1,0 +1,115 @@
+---CASE---
+---IN---
+12345
+---OUT---
+123451
+5    2
+4    3
+3    4
+2    5
+154321
+---CASE---
+---IN---
+HelloThere
+---OUT---
+HelloThereH
+e         e
+r         l
+e         l
+h         o
+T         T
+o         h
+l         e
+l         r
+e         e
+HerehTolleH
+---CASE---
+---IN---
+abcdef
+---OUT---
+abcdefa
+f     b
+e     c
+d     d
+c     e
+b     f
+afedcba
+---CASE---
+---IN---
+a
+---OUT---
+aa
+aa
+---CASE---
+---IN---
+at
+---OUT---
+ata
+t t
+ata
+---CASE---
+---IN---
+DASR
+---OUT---
+DASRD
+R   A
+S   S
+A   R
+DRSAD
+---CASE---
+---IN---
+studysmartnothard
+---OUT---
+studysmartnothards
+d                t
+r                u
+a                d
+h                y
+t                s
+o                m
+n                a
+t                r
+r                t
+a                n
+m                o
+s                t
+y                h
+d                a
+u                r
+t                d
+sdrahtontramsyduts
+---CASE---
+---IN---
+goodjobnowitsworkingwellenough
+---OUT---
+goodjobnowitsworkingwellenoughg
+h                             o
+g                             o
+u                             d
+o                             j
+n                             o
+e                             b
+l                             n
+l                             o
+e                             w
+w                             i
+g                             t
+n                             s
+i                             w
+k                             o
+r                             r
+o                             k
+w                             i
+s                             n
+t                             g
+i                             w
+w                             e
+o                             l
+n                             l
+b                             e
+o                             n
+j                             o
+d                             u
+o                             g
+o                             h
+ghguonellewgnikrowstiwonbojdoog

@@ -1,0 +1,25 @@
+# Кого проверять: all или список фамилий (можно "Фамилия" или "Фамилия_Имя")
+#students: all
+# students:
+#   - Аверин
+#   - Иванов_Иван
+students:
+  - Матвеев
+
+# Какие задачи проверять (номера как в answers/ и students/problem_N)
+problems: [3, 4, 5]
+
+# Параметры запуска
+timeout_sec: 2
+compile_timeout_sec: 20
+compiler: g++
+compile_flags: ["-O2", "-std=c++17", "-Wall"]
+memory_limit_mb: 256
+
+# Пути
+answers_dir: answers
+students_dir: students
+results_dir: results
+work_dir: .build
+
+# Учитывать только live/home? (пока не нужно — логика ниже жёсткая)
