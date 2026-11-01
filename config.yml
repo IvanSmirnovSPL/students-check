@@ -7,7 +7,7 @@ students:
   - Матвеев
 
 # Какие задачи проверять (номера как в answers/ и students/problem_N)
-problems: [3, 4, 5]
+problems: [1, 2, 3, 4, 5]
 
 # Параметры запуска
 timeout_sec: 2
