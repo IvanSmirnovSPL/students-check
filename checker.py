@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
-"""Проверка решений студентов: students/problem_N/*.cpp против answers/N.txt."""
+"""Проверка решений студентов: students/problem_N/*.cpp против answers/N.txt.
+
+Дополнительно (независимо от прохождения тестов) для каждого студента
+проверяется наличие `#include <vector>` и `#include <string>` во всех его
+попытках по всем задачам — «да/нет» плюс в скольких попытках заголовок есть.
+
+Бинарники собираются во временной папке (tempfile.TemporaryDirectory),
+которая удаляется при выходе: на диске не остаётся артефактов сборки.
+"""
 
 import csv
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import yaml
+from tqdm import tqdm
 
 
 # ---------- Парсинг имён файлов ----------
@@ -41,6 +51,8 @@ class Attempt:
     error: str = ""
     tests_passed: int = 0
     tests_total: int = 0
+    inc_vector: bool = False     # есть #include <vector> в исходнике
+    inc_string: bool = False     # есть #include <string> в исходнике
 
 
 class AnswerFormatError(Exception):
@@ -154,6 +166,33 @@ def parse_answer_file(path: Path) -> list[Case]:
     return cases
 
 
+# ---------- Инклуды ----------
+INCLUDE_RE = re.compile(r'^#\s*include\s*[<"]([^>"]+)[>"]', re.IGNORECASE)
+
+# Какие заголовки отслеживаем отдельно (имя в нижнем регистре -> человеческое имя)
+WATCHED_INCLUDES = ("vector", "string")
+
+
+def parse_includes(src: Path) -> set[str]:
+    """Множество подключённых заголовков (имена в нижнем регистре).
+
+    Понимает `#include <vector>`, `#include<vector>`, `#include  "vector"`,
+    хвостовые `;`/комментарии и регистр (`<Vector>`). Закомментированные
+    директивы (`//#include <vector>`) не учитываются — иначе студент получал бы
+    «да» за закомментированную строку.
+    """
+    text = src.read_text(encoding="utf-8", errors="replace")
+    found: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("//"):
+            continue
+        m = INCLUDE_RE.match(line)
+        if m:
+            found.add(m.group(1).strip().lower())
+    return found
+
+
 def normalize(s: str) -> str:
     """Нормализация для сравнения: незначащие хвостовые пробелы в строках
     и хвостовые пустые строки. Ведущие пробелы значимы — вывод бывает
@@ -232,10 +271,13 @@ def collect_attempts(students_dir: Path, problems: set[int], name_filter):
             kind = "live" if "live" in low else ("home" if "home" in low else "unknown")
             if kind == "unknown":
                 print(f"[warn] не понятно live/home: {f.name}", file=sys.stderr)
+            incs = parse_includes(f)
             att = Attempt(
                 file=f, fio=fio, surname=surname,
                 kind=kind, problem=problem,
                 attempt_no=int(m.group("attempt")),
+                inc_vector="vector" in incs,
+                inc_string="string" in incs,
             )
             attempts.setdefault((fio, problem), []).append(att)
     return attempts
@@ -280,22 +322,59 @@ def check_attempt(att: Attempt, tests: list[Case], cfg, work: Path, ans_name: st
     att.success = True
 
 
-def check_all(cfg, attempts, tests_by_problem):
-    work = Path(cfg["work_dir"])
-    work.mkdir(exist_ok=True)
+def check_all(cfg, attempts, tests_by_problem, work: Path):
+    """Прогоняет все попытки, складывая бинарники во временную папку `work`.
 
+    Прогресс — один бар на все попытки всех студентов и всех задач.
+    """
+    queue: list[tuple[str, int, Attempt]] = []
     for (fio, problem), atts in attempts.items():
-        tests = tests_by_problem[problem]
         # сначала live по возрастанию attempt, потом home
         atts.sort(key=lambda a: (0 if a.kind == "live" else 1, a.attempt_no))
-        for att in atts:
-            check_attempt(att, tests, cfg, work, f"answers/{problem}.txt")
+        queue.extend((fio, problem, att) for att in atts)
+
+    bar = tqdm(queue, desc="Проверка решений", unit="поп",
+               dynamic_ncols=True, leave=True)
+    for fio, problem, att in bar:
+        bar.set_postfix_str(f"p{problem} {att.surname} {att.kind} "
+                            f"#{att.attempt_no}", refresh=False)
+        check_attempt(att, tests_by_problem[problem], cfg, work,
+                      f"answers/{problem}.txt")
+        bar.set_postfix_str(f"p{problem} {att.surname} {att.kind} "
+                            f"#{att.attempt_no} {'OK' if att.success else 'FAIL'}",
+                            refresh=False)
+    bar.close()
     return attempts
+
+
+def group_by_student(attempts) -> dict[str, list[Attempt]]:
+    """Все попытки студента по всем задачам в одном списке."""
+    by_student: dict[str, list[Attempt]] = {}
+    for (fio, _), atts in attempts.items():
+        by_student.setdefault(fio, []).extend(atts)
+    return by_student
+
+
+def include_summary(atts: list[Attempt]) -> dict[str, str]:
+    """Сводка по инклудам для набора попыток (по всем задачам студента).
+
+    `has_*` — да/нет: встретился ли заголовок хотя бы в одной попытке,
+    `*_attempts` — в скольких попытках из скольких он есть.
+    """
+    total = len(atts)
+    out = {}
+    for header in WATCHED_INCLUDES:
+        flag = f"inc_{header}"
+        cnt = sum(1 for a in atts if getattr(a, flag))
+        out[f"has_{header}"] = "да" if cnt else "нет"
+        out[f"{header}_attempts"] = f"{cnt}/{total}" if total else "0/0"
+    return out
 
 
 # ---------- Формирование CSV ----------
 def build_csv(cfg, attempts):
     students = sorted({fio for (fio, _) in attempts.keys()})
+    by_student = group_by_student(attempts)
 
     # для каждого студента: были ли live-попытки по задаче
     live_attempted: dict[tuple[str, int], bool] = {}
@@ -344,6 +423,8 @@ def build_csv(cfg, attempts):
             row[f"p{problem}_counted"] = cell["counted"]
             row[f"p{problem}_tests"] = cell["tests"]
         row["total_counted"] = total
+        # отдельная проверка инклудов: по всем попыткам всех задач студента
+        row.update(include_summary(by_student.get(fio, [])))
         rows.append(row)
     return rows
 
@@ -360,6 +441,8 @@ def write_csv(cfg, rows):
         header += [f"p{p}_solved", f"p{p}_where", f"p{p}_attempt",
                    f"p{p}_counted", f"p{p}_tests"]
     header += ["total_counted"]
+    for h in WATCHED_INCLUDES:
+        header += [f"has_{h}", f"{h}_attempts"]
 
     with out.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
@@ -412,7 +495,10 @@ def main():
         print("Не найдено попыток по фильтру.", file=sys.stderr)
         sys.exit(1)
 
-    attempts = check_all(cfg, attempts, tests_by_problem)
+    # Бинарники собираем во временной папке: после проверки она удаляется
+    # вместе со всеми артефактами, на диске ничего не остаётся.
+    with tempfile.TemporaryDirectory(prefix="students-check-build-") as tmp:
+        attempts = check_all(cfg, attempts, tests_by_problem, Path(tmp))
 
     # лог по каждой попытке
     print("\n=== Детали проверок ===")
@@ -422,7 +508,20 @@ def main():
             passed = f"{a.tests_passed}/{a.tests_total}"
             extra = "" if a.success else f" — {a.error}"
             print(f"[{status}] {fio} | p{problem} | {a.kind} "
-                  f"attempt_{a.attempt_no} ({passed}){extra}")
+                  f"attempt_{a.attempt_no} ({passed}) "
+                  f"| vector={'да' if a.inc_vector else 'нет'} "
+                  f"string={'да' if a.inc_string else 'нет'}{extra}")
+
+    # сводка по инклудам: по всем попыткам всех задач
+    print("\n=== Инклуды vector/string (по всем попыткам всех задач) ===")
+    by_student = group_by_student(attempts)
+    for fio in sorted(by_student):
+        atts = by_student[fio]
+        summary = include_summary(atts)
+        print(f"{fio}: vector={summary['has_vector']} "
+              f"({summary['vector_attempts']} попыток), "
+              f"string={summary['has_string']} "
+              f"({summary['string_attempts']} попыток)")
 
     rows = build_csv(cfg, attempts)
     write_csv(cfg, rows)
