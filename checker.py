@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -203,16 +204,66 @@ def normalize(s: str) -> str:
     return "\n".join(line.rstrip() for line in lines)
 
 
+# ---------- Расшифровка вывода внешних программ ----------
+# «Русские» кодировки виндовых решений — после utf-8.
+_FALLBACK_ENCODINGS = ("cp1251", "cp866")
+# Признак «широкого» вывода без BOM: много нулевых байтов (ASCII в UTF-16).
+_NUL_RATIO = 0.25
+
+
+def decode_output(data: bytes) -> str:
+    """Декодирует stdout/stderr, не роняя весь прогон на «мусорных» байтах.
+
+    Решение студента может печатать не в UTF-8 (`0xff` в выводе — типичный
+    след cp1251/UTF-16 или вовсе двоичного мусора). Со `text=True` строгий
+    utf-8 бросал UnicodeDecodeError и проверка обрывалась на середине,
+    теряя уже собранные результаты. Теперь перебираем кодировки, а в
+    крайнем случае декодируем с заменой битых байтов: такой вывод просто
+    не совпадёт с эталоном, и попытка получит FAIL с диффом.
+
+    Порядок важен: utf-8 — норма; UTF-16 — только при явном BOM (кодек
+    utf-16 без BOM «успешно» разбирает любые чётные байты в мусор) либо
+    при куче нулей, характерных для широкого вывода; затем cp1251/cp866.
+    """
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            return data.decode("utf-16")
+        except UnicodeError:
+            pass
+
+    # Широкий вывод без BOM: NUL — валидный utf-8, поэтому сначала проверяем
+    # плотность нулей, иначе utf-8 «успешно» вернёт строку с \x00 внутри.
+    if len(data) % 2 == 0 and data and data.count(0) / len(data) > _NUL_RATIO:
+        enc = "utf-16-le" if data[1:2] == b"\x00" else "utf-16-be"
+        try:
+            return data.decode(enc)
+        except UnicodeError:
+            pass
+
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeError:
+        pass
+
+    for enc in _FALLBACK_ENCODINGS:
+        try:
+            return data.decode(enc)
+        except UnicodeError:
+            continue
+
+    return data.decode("utf-8", errors="replace")
+
+
 # ---------- Компиляция и запуск ----------
 def compile_cpp(src: Path, exe: Path, cfg) -> Optional[str]:
     cmd = [cfg["compiler"], *cfg.get("compile_flags", []), str(src), "-o", str(exe)]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
+        r = subprocess.run(cmd, capture_output=True,
                            timeout=cfg.get("compile_timeout_sec", 20))
     except subprocess.TimeoutExpired:
         return "compile timeout"
     if r.returncode != 0:
-        return "compile error:\n" + (r.stderr or "")[:2000]
+        return "compile error:\n" + decode_output(r.stderr or b"")[:2000]
     return None
 
 
@@ -230,11 +281,12 @@ def diff_message(expected: str, got: str) -> str:
 def run_case(exe: Path, case: Case, cfg) -> Optional[str]:
     """None — тест пройден, иначе текст ошибки."""
     try:
+        # stdin кодируем сами (UTF-8 — так же, как читается answers/N.txt),
+        # а stdout разбираем байтами: вывод решения не обязан быть UTF-8.
         r = subprocess.run(
             [str(exe)],
-            input=case.stdin,
+            input=case.stdin.encode("utf-8"),
             capture_output=True,
-            text=True,
             timeout=cfg.get("timeout_sec", 2),
         )
     except subprocess.TimeoutExpired:
@@ -242,10 +294,16 @@ def run_case(exe: Path, case: Case, cfg) -> Optional[str]:
     if r.returncode != 0:
         return f"runtime error (код возврата {r.returncode})"
     expected = normalize(case.expected)
-    got = normalize(r.stdout)
+    got = normalize(decode_output(r.stdout or b""))
     if expected == got:
         return None
     return diff_message(expected, got)
+
+
+# Сколько попыток проверять одновременно. Работа почти вся вне Python
+# (`g++` и бинарники — отдельные процессы), поэтому потоки дают реальный
+# параллелизм по ядрам, а GIL не мешает.
+DEFAULT_JOBS = 5
 
 
 # ---------- Сбор файлов студентов ----------
@@ -308,6 +366,8 @@ def load_tests(cfg, problems) -> tuple[dict[int, list[Case]], list[str]]:
 # ---------- Проверка ----------
 def check_attempt(att: Attempt, tests: list[Case], cfg, work: Path, ans_name: str) -> None:
     att.tests_total = len(tests)
+    # Имя бинарника уникально для попытки, поэтому параллельные проверки
+    # не перетирают файлы друг друга.
     exe = work / f"{att.file.stem}.out"
     err = compile_cpp(att.file, exe, cfg)
     if err:
@@ -322,10 +382,38 @@ def check_attempt(att: Attempt, tests: list[Case], cfg, work: Path, ans_name: st
     att.success = True
 
 
+def _check_attempt_guarded(att: Attempt, tests: list[Case], cfg,
+                           work: Path, ans_name: str, problem: int) -> str:
+    """Обёртка для пула: ловит исключения и возвращает строку статуса.
+
+    Одна «странная» попытка (битый вывод, падение компилятора и т.п.)
+    не должна обнулять результаты всего прогона.
+    """
+    try:
+        check_attempt(att, tests, cfg, work, ans_name)
+    except Exception as e:                           # noqa: BLE001
+        att.success = False
+        att.error = f"внутренняя ошибка проверки: {type(e).__name__}: {e}"
+    return f"p{problem} {att.surname} {att.kind} #{att.attempt_no} " \
+           f"{'OK' if att.success else 'FAIL'}"
+
+
+def _jobs(cfg) -> int:
+    try:
+        n = int(cfg.get("jobs", DEFAULT_JOBS))
+    except (TypeError, ValueError):
+        n = DEFAULT_JOBS
+    return max(1, n)
+
+
 def check_all(cfg, attempts, tests_by_problem, work: Path):
     """Прогоняет все попытки, складывая бинарники во временную папку `work`.
 
-    Прогресс — один бар на все попытки всех студентов и всех задач.
+    Попытки проверяются параллельно в пуле потоков (`jobs` штук, по умолчанию
+    `DEFAULT_JOBS`): узкое место — компиляция и запуск чужих бинарников, то есть
+    отдельные процессы, которые честно расходятся по ядрам. Прогресс — один бар
+    на все попытки всех студентов и всех задач; обновляет его только главный
+    поток.
     """
     queue: list[tuple[str, int, Attempt]] = []
     for (fio, problem), atts in attempts.items():
@@ -333,16 +421,30 @@ def check_all(cfg, attempts, tests_by_problem, work: Path):
         atts.sort(key=lambda a: (0 if a.kind == "live" else 1, a.attempt_no))
         queue.extend((fio, problem, att) for att in atts)
 
-    bar = tqdm(queue, desc="Проверка решений", unit="поп",
-               dynamic_ncols=True, leave=True)
-    for fio, problem, att in bar:
-        bar.set_postfix_str(f"p{problem} {att.surname} {att.kind} "
-                            f"#{att.attempt_no}", refresh=False)
-        check_attempt(att, tests_by_problem[problem], cfg, work,
-                      f"answers/{problem}.txt")
-        bar.set_postfix_str(f"p{problem} {att.surname} {att.kind} "
-                            f"#{att.attempt_no} {'OK' if att.success else 'FAIL'}",
-                            refresh=False)
+    jobs = _jobs(cfg)
+    bar = tqdm(total=len(queue), desc=f"Проверка решений (потоков: {jobs})",
+               unit="поп", dynamic_ncols=True, leave=True)
+
+    futures: dict[Future, tuple[int, Attempt]] = {}
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        for _, problem, att in queue:
+            fut = pool.submit(_check_attempt_guarded, att,
+                              tests_by_problem[problem], cfg, work,
+                              f"answers/{problem}.txt", problem)
+            futures[fut] = (problem, att)
+
+        for fut in as_completed(futures):
+            problem, att = futures[fut]
+            try:
+                status = fut.result()
+            except Exception as e:                   # noqa: BLE001
+                att.success = False
+                att.error = f"внутренняя ошибка проверки: {type(e).__name__}: {e}"
+                status = f"p{problem} {att.surname} {att.kind} " \
+                         f"#{att.attempt_no} FAIL"
+            bar.set_postfix_str(status, refresh=False)
+            bar.update(1)
+
     bar.close()
     return attempts
 
